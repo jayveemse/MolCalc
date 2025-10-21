@@ -1,0 +1,15 @@
+UID,Setup,Type,Setup Location,Setup Sub-Location,Sub-Setup Assembly,IO Type,Zone,Device Type,Device Tag,Device Location,Circuit,Power Source,NI LV Channel,Wire Label at NI,Wire Label at Device,Shorthand Tag,P,I,D,Owner
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Measurement,HA,PT,PT-5579,A,PC1(CB1),EDP-9 (UPS),CV1PT1,CV1PT1,PC1,HA-PT-A,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,FT#,Measurement,Internal,TC,TC-K-21,A,NI,Passive,CV1TC1,1,TC1,TC-Internal-1,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,-,Vessel,Body,,P,Middle,-,-,-,-,-,-,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,-,Vessel,Nozzle,,Z,Top,-,-,-,-,-,-,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,-,Vessel,Grand Nut,,P,Top,-,-,-,-,-,-,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,-,Vessel,Gasket,,New1_4,Top,-,-,-,-,-,-,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,-,Vessel,Bolts,,New1_Rene,Top,-,-,-,-,-,-,,,,
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,Safety Head,,SH-20,Top,-,-,-,-,-,-,,,,FT#
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,NV,,NV-18,Top,-,-,-,-,-,-,,,,FT#
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,Junction,,CR-7,Top,-,-,-,-,-,-,,,,FT#
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,Tubing-RD,,38,Top,-,-,-,-,-,-,,,,FT#
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,Tubing-NV,,53,Top,-,-,-,-,-,-,,,,FT#
+EXP_AC_P_221201,HPS_P_221201,Autoclave,HPS,P,HA,Head,Tubing-PT,,47,Top,-,-,-,-,-,-,,,,FT#
+,,,,,,,,,,,,,,,,,,,,FT#
