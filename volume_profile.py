@@ -1,17 +1,31 @@
 """
-volume_profile.py — standalone MolCalc volume profile generator.
+volume_profile.py — standalone MolCalc volume profile + single-moment mole calc.
 
-Run:  python volume_profile.py
-You will be prompted (file dialogs) for:
+Run:  python volume_profile.py      (or  %run volume_profile.py  in Jupyter)
+You will be prompted for:
   1. Autoclave Layout file (.xlsx)
   2. MLD - FUR (.xlsx)
   3. MLD - HPS (.xlsx)
   4. Surface Mating Table (.xlsx)
-  5. Where to save the output Excel file
+  5. (Mole calc window) z, T points along the system axis, a uniform pressure,
+     and an optional z offset — or "Skip" for volume only
+  6. Where to save the output Excel file
+
+Mole calc:
+  - T(z): natural cubic spline through your (z, T) points, evaluated at the
+    centre of every 0.01 mm volume slice. Outside your z range T is held at the
+    first/last value (no spline extrapolation).
+  - Z(T, P): N2_Z.npz from generate_Z_table.py (Dropbox File Dependencies),
+    same clamping as MolCalc v0_8 (T/P clamped to table range, Z clipped 0.5–2).
+  - n = sum_i  P * V_i / (Z_i * R * T_i)
 
 Output workbook:
-  - "Volume Profile": volumeDF (0.01 mm slices; per-part volume in mm^3 per slice + Total Volume)
+  - "Mole Calc":      result + inputs (only if the mole calc was run)
+  - "T Input":        your z, T points
+  - "Volume Profile": volumeDF (0.01 mm slices; per-part volume mm^3/slice, Total Volume,
+                      and T_C, T_K, Z, n_slice_mmol, n_cumulative_mmol if mole calc ran)
   - "Part Summary":   total volume per part (mm^3 and mL) + material
+  Plus a .png of the V + T plot next to the .xlsx.
 
 The geometry functions below are copied verbatim from MolCalc_v0_8.ipynb
 (getPartVolProfile, safe_parse_profile, _build_profile_sequence,
@@ -707,6 +721,257 @@ def getSystemVolumeProfile(partList, mating_table_path, fur_path, hps_path):
     return volumeDF, uid_to_material
 
 # =============================================================================
+# Single-moment mole calculation
+# =============================================================================
+
+R_GAS = 8.3145          # J/(mol K) — same value MolCalc uses
+SLICE_MM = 0.01         # volumeDF resolution (mm per row)
+P_UNITS_TO_MPA = {'MPa': 1.0, 'psi': 0.00689475729, 'bar': 0.1}
+
+Z_TABLE_NAME = 'N2_Z.npz'   # produced by generate_Z_table.py
+
+
+def find_z_table():
+    """Look for the Z table in Dropbox File Dependencies, then repo dependencies/,
+    then ask. Returns a path, or None to fall back to ideal gas (Z = 1)."""
+    for d in (_DROPBOX_DEPS, _REPO_DEPS, os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(d, Z_TABLE_NAME)
+        if os.path.isfile(p):
+            return p
+    if messagebox.askyesno('Z Table Not Found',
+                           f'{Z_TABLE_NAME} was not found in:\n{_DROPBOX_DEPS}\nor\n{_REPO_DEPS}\n\n'
+                           'Locate it manually?\n(No = use ideal gas, Z = 1)'):
+        p = filedialog.askopenfilename(title=f'Select {Z_TABLE_NAME}', initialdir=DEFAULT_DIR,
+                                       filetypes=(('NumPy archive', '*.npz'), ('All files', '*.*')))
+        return p or None
+    return None
+
+
+class ZLookup:
+    """Z(T [K], P [MPa]) from the generate_Z_table.py .npz — same clamping as MolCalc v0_8."""
+    def __init__(self, path):
+        from scipy.interpolate import RegularGridInterpolator
+        self.path = path
+        if path is None:
+            self.interp = None
+            return
+        d = np.load(path)
+        self.interp = RegularGridInterpolator((d['T_K'], d['P_MPa']), d['Z'],
+                                              bounds_error=False, fill_value=None)
+        self.T_min, self.T_max = float(d['T_K'].min()), float(d['T_K'].max())
+        self.P_min, self.P_max = float(d['P_MPa'].min()), float(d['P_MPa'].max())
+
+    def __call__(self, T_K, P_MPa):
+        T_K = np.asarray(T_K, dtype=float)
+        if self.interp is None:
+            return np.ones_like(T_K)
+        P = np.clip(P_MPa, self.P_min, self.P_max)
+        T = np.clip(T_K, self.T_min, self.T_max)
+        Z = self.interp(np.column_stack([T, np.full(T.size, P)]))
+        return np.clip(Z, 0.5, 2.0)
+
+
+def parse_zT_text(text):
+    """Parse 'z, T' pairs (comma / tab / space separated, one per line).
+    Lines that don't start with a number (headers, comments) are skipped."""
+    z, T = [], []
+    for line in text.splitlines():
+        parts = [p for p in line.replace(',', ' ').replace('\t', ' ').replace(';', ' ').split() if p]
+        if len(parts) < 2:
+            continue
+        try:
+            zi, Ti = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        z.append(zi)
+        T.append(Ti)
+    if len(z) < 2:
+        raise ValueError('Need at least 2 (z, T) points.')
+    z, T = np.array(z), np.array(T)
+    order = np.argsort(z)
+    z, T = z[order], T[order]
+    if np.any(np.diff(z) == 0):
+        dup = z[:-1][np.diff(z) == 0]
+        raise ValueError(f'Duplicate z values: {sorted(set(dup.tolist()))}')
+    return z, T
+
+
+def build_T_profile(z_pts, T_pts_C, z_slices):
+    """Natural cubic spline through the points, evaluated at z_slices.
+    Outside [z_min, z_max] T is held at the end value (no spline extrapolation)."""
+    from scipy.interpolate import CubicSpline
+    cs = CubicSpline(z_pts, T_pts_C, bc_type='natural')
+    zc = np.clip(z_slices, z_pts[0], z_pts[-1])
+    return cs(zc), cs
+
+
+def ask_moment_inputs(root, z_lo, z_hi):
+    """Modal window: paste/load (z, T) points, enter pressure + z offset.
+    Returns dict, or None if the user skips the mole calc."""
+    result = {}
+    win = tk.Toplevel(root)
+    win.title('Single-Moment Mole Calc — Inputs')
+    win.attributes('-topmost', True)
+    win.geometry('520x620')
+
+    tk.Label(win, text=f'Volume profile spans {z_lo:.2f} – {z_hi:.2f} mm (system axis, x = 0 at bottom of stack)',
+             fg='navy', wraplength=490, justify='left').pack(anchor='w', padx=10, pady=(10, 4))
+    tk.Label(win, text='T profile points — one "z_mm, T_C" pair per line\n'
+                       '(comma, tab or space separated; header lines ignored; paste from Excel OK)',
+             justify='left').pack(anchor='w', padx=10)
+
+    txt_frame = tk.Frame(win)
+    txt_frame.pack(fill='both', expand=True, padx=10, pady=4)
+    txt = tk.Text(txt_frame, height=16, font=('Menlo', 12))
+    sb = tk.Scrollbar(txt_frame, command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    txt.pack(side='left', fill='both', expand=True)
+    sb.pack(side='right', fill='y')
+    txt.insert('1.0', '# z_mm, T_C\n')
+
+    def load_csv():
+        p = filedialog.askopenfilename(parent=win, title='Load z, T CSV',
+                                       filetypes=(('CSV / text', '*.csv *.txt *.tsv'), ('Excel', '*.xlsx'),
+                                                  ('All files', '*.*')))
+        if not p:
+            return
+        try:
+            if p.lower().endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(p, header=None)
+                content = '\n'.join(f'{a}, {b}' for a, b in df.iloc[:, :2].itertuples(index=False))
+            else:
+                with open(p) as f:
+                    content = f.read()
+            txt.delete('1.0', 'end')
+            txt.insert('1.0', content)
+        except Exception as e:
+            messagebox.showerror('Load Error', str(e), parent=win)
+
+    tk.Button(win, text='Load z, T from file…', command=load_csv).pack(anchor='w', padx=10)
+
+    form = tk.Frame(win)
+    form.pack(fill='x', padx=10, pady=8)
+    tk.Label(form, text='Pressure (uniform):').grid(row=0, column=0, sticky='w')
+    p_var = tk.StringVar()
+    tk.Entry(form, textvariable=p_var, width=12).grid(row=0, column=1, sticky='w')
+    unit_var = tk.StringVar(value='MPa')
+    tk.OptionMenu(form, unit_var, *P_UNITS_TO_MPA.keys()).grid(row=0, column=2, sticky='w')
+    tk.Label(form, text='z offset (mm, added to your z):').grid(row=1, column=0, sticky='w', pady=(6, 0))
+    off_var = tk.StringVar(value='0')
+    tk.Entry(form, textvariable=off_var, width=12).grid(row=1, column=1, sticky='w', pady=(6, 0))
+
+    btns = tk.Frame(win)
+    btns.pack(fill='x', padx=10, pady=(0, 10))
+
+    def ok():
+        try:
+            z, T = parse_zT_text(txt.get('1.0', 'end'))
+            P_raw = float(p_var.get())
+            off = float(off_var.get() or 0)
+        except ValueError as e:
+            messagebox.showerror('Input Error', str(e) if 'z' in str(e) or 'point' in str(e)
+                                 else 'Pressure and z offset must be numbers.', parent=win)
+            return
+        if P_raw <= 0:
+            messagebox.showerror('Input Error', 'Pressure must be > 0.', parent=win)
+            return
+        result.update(z=z + off, T_C=T, z_offset=off, P_input=P_raw, P_unit=unit_var.get(),
+                      P_MPa=P_raw * P_UNITS_TO_MPA[unit_var.get()],
+                      raw_text=txt.get('1.0', 'end'))
+        win.destroy()
+
+    def skip():
+        win.destroy()
+
+    tk.Button(btns, text='Calculate Moles', command=ok, default='active').pack(side='right')
+    tk.Button(btns, text='Skip (volume only)', command=skip).pack(side='right', padx=6)
+    win.protocol('WM_DELETE_WINDOW', skip)
+    win.grab_set()
+    root.wait_window(win)
+    return result or None
+
+
+def calc_moles(volumeDF, inputs, zlookup):
+    """Adds per-slice T, Z and n columns to volumeDF; returns (volumeDF, summary dict)."""
+    z_start = volumeDF['Axial Position'].to_numpy(dtype=float)
+    z_mid = z_start + SLICE_MM / 2                      # evaluate T at slice centre
+    V_mm3 = volumeDF['Total Volume'].fillna(0).to_numpy(dtype=float)
+
+    T_C, _ = build_T_profile(inputs['z'], inputs['T_C'], z_mid)
+    T_K = T_C + 273.15
+    if np.any(T_K <= 0):
+        raise ValueError('Spline produced T <= 0 K — check your T points.')
+    P_MPa = inputs['P_MPa']
+    Z = zlookup(T_K, P_MPa)
+    V_m3 = V_mm3 * 1e-9
+    n_slice = (P_MPa * 1e6 * V_m3) / (Z * R_GAS * T_K)
+
+    volumeDF = volumeDF.copy()
+    volumeDF['T_C'] = T_C
+    volumeDF['T_K'] = T_K
+    volumeDF['Z'] = Z
+    volumeDF['n_slice_mmol'] = n_slice * 1e3
+    volumeDF['n_cumulative_mmol'] = np.cumsum(n_slice) * 1e3
+
+    n_tot = n_slice.sum()
+    V_tot = V_m3.sum()
+    outside = (z_mid < inputs['z'][0]) | (z_mid > inputs['z'][-1])
+    V_out = V_m3[outside].sum()
+    n_ideal = (P_MPa * 1e6 * V_m3 / (R_GAS * T_K)).sum()
+    summary = {
+        'n_total_mol': n_tot,
+        'n_total_mmol': n_tot * 1e3,
+        'n_ideal_gas_mmol (Z=1)': n_ideal * 1e3,
+        'V_total_mL': V_tot * 1e6,
+        'P_input': inputs['P_input'],
+        'P_unit': inputs['P_unit'],
+        'P_MPa': P_MPa,
+        'z_offset_mm': inputs['z_offset'],
+        'T_points': len(inputs['z']),
+        'T_input_z_range_mm (after offset)': f"{inputs['z'][0]:.2f} – {inputs['z'][-1]:.2f}",
+        'Volume-weighted mean T_C': float((T_C * V_m3).sum() / V_tot) if V_tot else np.nan,
+        'Gas-weighted mean T_C (V/sum(V/T))': float(V_tot / (V_m3 / T_K).sum() - 273.15) if V_tot else np.nan,
+        'Volume outside T-point range (mL, T held at end value)': V_out * 1e6,
+        'Volume outside T-point range (%)': 100 * V_out / V_tot if V_tot else np.nan,
+        'Z range': f'{Z.min():.5f} – {Z.max():.5f}',
+        'Z table': zlookup.path or 'NONE — ideal gas (Z = 1)',
+        'Spline': 'Natural cubic (scipy CubicSpline), evaluated at 0.01 mm slice centres',
+    }
+    return volumeDF, summary
+
+
+def plot_profiles(volumeDF, inputs, summary, title, save_path=None):
+    import matplotlib.pyplot as plt
+    z = volumeDF['Axial Position'].to_numpy(dtype=float) + SLICE_MM / 2
+    V_per_mm = volumeDF['Total Volume'].fillna(0).to_numpy(dtype=float) / SLICE_MM   # mm^3 per mm (= mm^2)
+
+    fig, axV = plt.subplots(figsize=(12, 5.5))
+    axV.fill_between(z, V_per_mm, step='mid', color='tab:blue', alpha=0.25, lw=0)
+    axV.plot(z, V_per_mm, color='tab:blue', lw=0.8, label='Volume (mm³ per mm)')
+    axV.set_xlabel('Axial position z (mm)')
+    axV.set_ylabel('Volume per mm (mm³/mm)', color='tab:blue')
+    axV.tick_params(axis='y', labelcolor='tab:blue')
+    axV.set_xlim(z[0], z[-1])
+
+    axT = axV.twinx()
+    axT.plot(z, volumeDF['T_C'], color='tab:red', lw=1.8, label='T (cubic spline)')
+    axT.plot(inputs['z'], inputs['T_C'], 'o', color='black', ms=5, label='T input points')
+    axT.set_ylabel('Temperature (°C)', color='tab:red')
+    axT.tick_params(axis='y', labelcolor='tab:red')
+
+    lines = axV.get_legend_handles_labels()[0] + axT.get_legend_handles_labels()[0]
+    labels = axV.get_legend_handles_labels()[1] + axT.get_legend_handles_labels()[1]
+    axV.legend(lines, labels, loc='upper left')
+    axV.set_title(f"{title}\nn = {summary['n_total_mmol']:.4f} mmol   |   "
+                  f"P = {summary['P_input']:g} {summary['P_unit']}   |   V = {summary['V_total_mL']:.3f} mL")
+    axV.grid(alpha=0.3)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=200)
+    return fig
+
+
+# =============================================================================
 # Standalone driver
 # =============================================================================
 
@@ -719,6 +984,20 @@ def _ask(title, initialdir):
         sys.exit(0)
     print(f'{title}: {path}')
     return path
+
+
+def _part_summary(volumeDF, uid_to_material):
+    rows = []
+    for col in volumeDF.columns:
+        if 'Part_' in col:
+            uid = col.split('_', 3)[-1] if col.startswith(('External_', 'Internal_')) else col.split('_', 2)[-1]
+            v = volumeDF[col].sum(skipna=True)
+            rows.append({'Column': col, 'UID': uid,
+                         'Material': uid_to_material.get(str(uid), ''),
+                         'Volume (mm^3)': v, 'Volume (mL)': v / 1000})
+    total = volumeDF['Total Volume'].sum()
+    rows.append({'Column': 'Total Volume', 'Volume (mm^3)': total, 'Volume (mL)': total / 1000})
+    return pd.DataFrame(rows)
 
 
 def main():
@@ -749,48 +1028,86 @@ def main():
     if len(nonzero):
         volumeDF = volumeDF.loc[:nonzero[-1]]
     volumeDF = volumeDF.reset_index(drop=True)
-
-    # Per-part summary
-    rows = []
-    for col in volumeDF.columns:
-        if 'Part_' in col:
-            uid = col.split('_', 3)[-1] if col.startswith(('External_', 'Internal_')) else col.split('_', 2)[-1]
-            v = volumeDF[col].sum(skipna=True)
-            rows.append({'Column': col, 'UID': uid,
-                         'Material': uid_to_material.get(str(uid), ''),
-                         'Volume (mm^3)': v, 'Volume (mL)': v / 1000})
-    summaryDF = pd.DataFrame(rows)
+    summaryDF = _part_summary(volumeDF, uid_to_material)
     total = volumeDF['Total Volume'].sum()
-    summaryDF = pd.concat([summaryDF, pd.DataFrame([{
-        'Column': 'Total Volume', 'Volume (mm^3)': total, 'Volume (mL)': total / 1000}])],
-        ignore_index=True)
-
     layout_stem = os.path.splitext(os.path.basename(layout_file))[0]
+
+    # ── Single-moment mole calc ──────────────────────────────────────────
+    z_lo = float(volumeDF['Axial Position'].iloc[0])
+    z_hi = float(volumeDF['Axial Position'].iloc[-1]) + SLICE_MM
+    inputs = ask_moment_inputs(root, z_lo, z_hi)
+    mole_summary = None
+    fig = None
+    if inputs:
+        zlookup = ZLookup(find_z_table())
+        print(f"\nZ table: {zlookup.path or 'NONE — ideal gas (Z = 1)'}")
+        try:
+            volumeDF, mole_summary = calc_moles(volumeDF, inputs, zlookup)
+        except Exception as e:
+            messagebox.showerror('Mole Calc', f'Mole calculation failed:\n{e}')
+            sys.exit(1)
+
+        print('\nMOLE CALC RESULT')
+        for k, v in mole_summary.items():
+            print(f'  {k}: {v}')
+        fig = plot_profiles(volumeDF, inputs, mole_summary, layout_stem)
+
+        warn = ''
+        if mole_summary['Volume outside T-point range (%)'] > 0.5:
+            warn = (f"\n\n⚠ {mole_summary['Volume outside T-point range (%)']:.1f}% of the volume lies outside "
+                    f"your T-point z range — T was held at the end values there.")
+        if zlookup.path is None:
+            warn += '\n\n⚠ No Z table — ideal gas (Z = 1) used.'
+        messagebox.showinfo('Mole Calc Result',
+                            f"n = {mole_summary['n_total_mmol']:.4f} mmol\n"
+                            f"   ({mole_summary['n_total_mol']:.6f} mol)\n\n"
+                            f"P = {inputs['P_input']:g} {inputs['P_unit']} ({inputs['P_MPa']:.4f} MPa)\n"
+                            f"V = {mole_summary['V_total_mL']:.3f} mL\n"
+                            f"Gas-weighted mean T = {mole_summary['Gas-weighted mean T_C (V/sum(V/T))']:.1f} °C"
+                            f"{warn}")
+
+    # ── Save ─────────────────────────────────────────────────────────────
     out_path = filedialog.asksaveasfilename(
         title='Save Volume Profile As',
         initialdir=os.path.dirname(layout_file),
-        initialfile=f'volumeDF_{layout_stem}.xlsx',
+        initialfile=f"{'MoleCalc' if mole_summary else 'volumeDF'}_{layout_stem}.xlsx",
         defaultextension='.xlsx',
         filetypes=(('Excel files', '*.xlsx'),))
     if not out_path:
-        messagebox.showinfo('Volume Profile', 'Save cancelled — nothing written.')
-        sys.exit(0)
+        print('Save cancelled — nothing written.')
+    else:
+        print(f'\nWriting {len(volumeDF):,} rows to {out_path} ...')
+        with pd.ExcelWriter(out_path, engine='openpyxl') as xw:
+            if mole_summary:
+                ms = pd.DataFrame(list(mole_summary.items()), columns=['Quantity', 'Value'])
+                ms = pd.concat([ms, pd.DataFrame([
+                    {'Quantity': 'Layout', 'Value': layout_file},
+                    {'Quantity': 'MLD - FUR', 'Value': fur_file},
+                    {'Quantity': 'MLD - HPS', 'Value': hps_file},
+                    {'Quantity': 'Mating Table', 'Value': mating_file}])], ignore_index=True)
+                ms.to_excel(xw, sheet_name='Mole Calc', index=False)
+                pd.DataFrame({'z_input_mm': inputs['z'] - inputs['z_offset'],
+                              'z_system_mm (after offset)': inputs['z'],
+                              'T_C': inputs['T_C']}).to_excel(xw, sheet_name='T Input', index=False)
+            volumeDF.to_excel(xw, sheet_name='Volume Profile', index=False)
+            summaryDF.to_excel(xw, sheet_name='Part Summary', index=False)
+        if fig is not None:
+            png = os.path.splitext(out_path)[0] + '.png'
+            fig.savefig(png, dpi=200)
+            print(f'Plot saved: {png}')
+        print('Done.')
+        if messagebox.askyesno('Volume Profile', f'Saved:\n{out_path}\n\nOpen it now?'):
+            if sys.platform == 'darwin':
+                os.system(f'open "{out_path}"')
+            elif os.name == 'nt':
+                os.startfile(out_path)
+            else:
+                os.system(f'xdg-open "{out_path}"')
 
-    print(f'\nWriting {len(volumeDF):,} rows to {out_path} ...')
-    with pd.ExcelWriter(out_path, engine='openpyxl') as xw:
-        volumeDF.to_excel(xw, sheet_name='Volume Profile', index=False)
-        summaryDF.to_excel(xw, sheet_name='Part Summary', index=False)
-    print('Done.')
-
-    if messagebox.askyesno('Volume Profile',
-                           f'Saved:\n{out_path}\n\nTotal volume: {total/1000:.3f} mL\n\nOpen it now?'):
-        if sys.platform == 'darwin':
-            os.system(f'open "{out_path}"')
-        elif os.name == 'nt':
-            os.startfile(out_path)
-        else:
-            os.system(f'xdg-open "{out_path}"')
     root.destroy()
+    if fig is not None:
+        import matplotlib.pyplot as plt
+        plt.show()
 
 
 if __name__ == '__main__':
